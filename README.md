@@ -213,8 +213,8 @@ it.
      with your Venmo username — the one at the end of your profile URL,
      without the @.
 
-     Example, for a handle of  dustin-s :
-       > ### **[@dustin-s](https://venmo.com/u/dustin-s)**
+     Example, for a handle of  jane-doe :
+       > ### **[@jane-doe](https://venmo.com/u/jane-doe)**
      ──────────────────────────────────────────────────────────────────── -->
 
 **Other ways to help, which are worth just as much:** open an issue when
