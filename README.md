@@ -31,6 +31,10 @@ don't have, and the source.
 Built for a video-editing workflow — camera footage and a Premiere project
 authored on a Mac, edited on a PC — but nothing here is specific to video.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Mac Drive Manager: drive detected, local working copy, and the status log" width="620">
+</p>
+
 > **Free, and staying free.** If it saves you a licence fee, you can
 > [buy me a coffee on Venmo](https://venmo.com/u/Dustin-DivineSicherman) — completely
 > optional, nothing is gated. See [Donate](#donate).
