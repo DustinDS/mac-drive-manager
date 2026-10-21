@@ -1,25 +1,17 @@
 # Mac Drive Manager
 
-Read **and write** a Mac-formatted (HFS+) external drive from Windows 11, without
-reformatting it — plus a fast local working copy that syncs back automatically
-when you eject.
+**Read and write Mac-formatted (HFS+) drives on Windows — free, without
+reformatting, and without buying a driver.**
 
-Built for a video-editing workflow: the drive holds camera footage and an Adobe
-Premiere project, the Mac is the authoring machine, and the PC needs to edit the
-same files without the drive being erased or corrupted.
+Plug a Mac drive into Windows and nothing happens. Disk Management sees the
+hardware; Explorer sees nothing. Windows has no HFS+ support at all, so the
+drive has no volume and no letter.
 
----
-
-## The problem
-
-Windows has no HFS+ support at all. A Mac-formatted drive shows up as a disk with
-no readable volume and no drive letter — Disk Management sees hardware, Explorer
-sees nothing.
-
-The paid options (Paragon HFS+, MacDrive) work fine. This project is the free
-route, and it costs a kernel build.
-
-## How it works
+The usual fix is to buy a commercial filesystem driver — MacDrive runs around
+**$50**, Paragon HFS+ for Windows around **$20** (check current pricing; these
+are ballpark). They work well. This does the same job for **$0**, using parts
+you already have a licence to: WSL2, the Linux kernel's own HFS+ driver, and
+Microsoft's `usbipd-win`.
 
 ```
 Windows  ──usbipd──►  WSL2  ──hfsplus.ko──►  /mnt/mac  ──\\wsl.localhost──►  Explorer
@@ -27,69 +19,87 @@ Windows  ──usbipd──►  WSL2  ──hfsplus.ko──►  /mnt/mac  ─�
 
 1. **usbipd-win** forwards the physical USB device into WSL2.
 2. A **custom-built `hfsplus` kernel module** mounts the volume read-write.
-3. Windows reaches it over `\\wsl.localhost\<distro>\mnt\mac`.
+3. Windows reaches it at `\\wsl.localhost\<distro>\mnt\mac`.
 4. A **local working copy** on a fast internal disk is where you actually edit;
    it syncs back to the drive before every eject.
 
-### Why a custom kernel and not just a module
+What you give up versus the paid tools: a one-time ~20 minute setup including a
+kernel compile, and the drive appears at a UNC path rather than as a drive
+letter. What you get: the same read-write access, a sync workflow the paid tools
+don't have, and the source.
 
-Microsoft's stock WSL2 kernel ships `CONFIG_HFSPLUS_FS` **unset**. The Kconfig
-symbol still exists, so the source is there and can be compiled — but two things
-bite:
-
-- `CONFIG_MODVERSIONS=y` means symbol CRCs must match, and those only come from
-  `Module.symvers`, which requires a **full** kernel build. A
-  `modules_prepare`-only build produces a module that dies with
-  `disagrees about version of symbol module_layout`.
-- Rebuilding from the same source with a *different compiler* produces different
-  CRCs than Microsoft's prebuilt binary, so the module still won't load into the
-  stock kernel.
-
-So the build installs the kernel it compiled and points WSL at it via
-`.wslconfig`. Kernel and modules then match by construction and nothing needs
-force-loading.
-
-`install/02-build-hfsplus-module.sh` automates all of it, including deleting
-`.git` from the source tree — otherwise `scripts/setlocalversion` appends `+` to
-the version string and the kernel looks for modules in a directory that doesn't
-exist.
+Built for a video-editing workflow — camera footage and a Premiere project
+authored on a Mac, edited on a PC — but nothing here is specific to video.
 
 ---
 
-## Requirements
+## Quickstart
 
-- Windows 10/11 with virtualization **enabled in BIOS**
-  (AMD: `SVM Mode`; Intel: `Intel VT-x`)
-- Administrator access for the one-time setup
-- ~30 GB free for the kernel build (reclaimable afterwards)
-- An internal disk with room for the working copy
+**The short version: run three scripts, reboot twice, done.**
 
-## Install
+**Before anything:** enable CPU virtualization in your BIOS. It is off by default
+on a lot of machines and nothing here works without it.
+- AMD → **SVM Mode** (often under *OC*, or *Advanced → CPU Features*)
+- Intel → **Intel VT-x** / *Virtualization Technology*
+- Verify in Task Manager → Performance → CPU → **Virtualization: Enabled**
 
+**1. Install the host side** — elevated PowerShell, then reboot:
 ```powershell
-# 1. Elevated PowerShell - features, WSL, Ubuntu, usbipd-win
 .\install\01-install-wsl-and-usbipd.ps1
-# reboot
 ```
 
+**2. Build the HFS+ driver** — inside WSL, takes 15–25 minutes:
 ```bash
-# 2. Inside WSL, as root - builds and installs the kernel + hfsplus module
 sudo bash install/02-build-hfsplus-module.sh
 ```
+It prints a `.wslconfig` snippet at the end. Add it, then `wsl --shutdown`.
 
-Follow the printed `.wslconfig` instructions, then `wsl --shutdown`.
-
+**3. Point it at your drive.** Plug the drive in and find its ID:
 ```powershell
-# 3. Configure, then bind the drive (elevated, once - the binding persists)
-copy macdrive.conf.example macdrive.conf   # edit it first
+usbipd list
+```
+Copy the `VID:PID` (looks like `0781:55af`). Then:
+```powershell
+copy macdrive.conf.example macdrive.conf
+notepad macdrive.conf
+```
+Set `HWID` to your `VID:PID`, and set `LOCAL_WIN` / `LOCAL_WSL` to where you want
+the working copy (same folder, two spellings). Then, elevated once:
+```powershell
 .\install\03-bind-drive.ps1
 ```
 
-Find your drive's `VID:PID` for `macdrive.conf` with `usbipd list`.
+**4. Run it.** Double-click **`Start.cmd`** (or `app\MacDriveManager.exe`). Press
+**Mount Read/Write**. That's it.
 
-## Use
+> **The one rule: always use *Eject Safely* before unplugging.** It flushes
+> writes, syncs your work back, and sets the flag macOS checks on the next
+> mount. Pulling the cable while mounted is the one thing that can hurt you.
 
-Run `app\MacDriveManager.vbs` (make a Desktop shortcut to it).
+---
+
+## Download
+
+Grab the latest build from [**Releases**](../../releases) — a zip with
+everything in it.
+
+| Run it as | How |
+|---|---|
+| **`.exe`** | `app\MacDriveManager.exe` — double-click |
+| **`.cmd`** | `Start.cmd` in the root — double-click, no console window |
+| **`.ps1`** | `powershell -ExecutionPolicy Bypass -File app\MacDriveManager.ps1` |
+
+All three run the same code. The `.exe` is the `.ps1` wrapped by
+[ps2exe](https://github.com/MScholtes/PS2EXE) — it is unsigned, so SmartScreen
+may warn on first run (*More info → Run anyway*), and some antivirus engines are
+twitchy about PowerShell-derived executables. If you would rather not trust a
+binary from a stranger, use `Start.cmd`; it is three lines you can read.
+
+Make a Desktop shortcut to whichever you pick.
+
+---
+
+## Using it
 
 | Button | Does |
 |---|---|
@@ -98,37 +108,38 @@ Run `app\MacDriveManager.vbs` (make a Desktop shortcut to it).
 | Get from Drive | Manual pull |
 | Send to Drive | Manual push |
 | Open Project | Opens the newest `.prproj` from the **local** copy |
+| Open Local Folder | Explorer, at the working copy |
 | Eject Safely | Syncs back, unmounts, releases the drive |
 
-The **auto-sync toggle** (top right) controls whether mounting pulls and ejecting
-pushes automatically. The setting persists in `settings.json`.
+The **auto-sync toggle** (top right) decides whether mounting pulls and ejecting
+pushes automatically. It persists in `settings.json`.
+
+Edit from the **local working copy**, not the drive. The drive is reachable over
+a network-style share, which is fine for copying but slow for scrubbing a
+timeline. Eject syncs your changes back.
 
 ---
 
 ## Safety
 
-**Always use Eject Safely.** This is the one rule that matters.
-
 Journaled HFS+ has to be mounted `-o force`, because Linux does not maintain
-Apple's journal. A clean unmount sets the volume's `kHFSVolumeUnmounted` flag and
-clears `kHFSVolumeInconsistent`, which is what macOS checks on the next mount.
-Yanking the cable while mounted leaves it flagged inconsistent.
-
-Measured, on a volume written from Linux:
+Apple's journal. A clean unmount sets `kHFSVolumeUnmounted` and clears
+`kHFSVolumeInconsistent`, which is what macOS checks next time. Measured on a
+volume written from Linux:
 
 ```
 while mounted : attributes 0x80002800  Unmounted=False  Inconsistent=True
 after unmount : attributes 0x80002100  Unmounted=True   Inconsistent=False
 ```
 
-Sync behaviour is deliberately conservative:
+Sync is deliberately conservative:
 
 - **Newer wins** in both directions (`rsync -au`)
 - **Deletions never propagate.** Delete a file locally and it stays on the drive.
 - **Every overwrite is archived** to a timestamped folder, never discarded.
 
-If you go back and forth often, consider disabling the journal from the Mac —
-non-destructive, keeps every file, and removes the only real fragility here:
+If you hop between machines often, consider turning the journal off from the Mac
+— non-destructive, keeps every file, removes the only real fragility here:
 
 ```bash
 sudo diskutil disableJournal "/Volumes/Your Drive"
@@ -137,25 +148,60 @@ sudo diskutil disableJournal "/Volumes/Your Drive"
 ## Known limitations
 
 - **Trailing spaces in names.** macOS allows `Back Up `; Win32 strips the space,
-  so such a folder becomes unreachable from normal Windows paths (and recursive
-  listings double-count it). Rename it on the Mac. Leading spaces are fine.
+  so such a folder is unreachable from normal Windows paths and recursive
+  listings double-count it. Rename it on the Mac. Leading spaces are fine.
 - **Premiere relinks on every platform switch.** The project stores paths, and
-  `/Volumes/Drive/...` can't be `D:\Working\...`. Identical relative layout means
-  Premiere usually auto-matches all but one clip. Unavoidable, not a bug here.
+  `/Volumes/Drive/...` cannot be `D:\Working\...`. Identical relative layout
+  means Premiere usually auto-matches all but one clip. Not specific to this
+  tool; it happens with the paid drivers too.
 - **Preview/render files rebuild per platform.**
 - **The mount dies if WSL idles out.** The app holds a keep-alive process; if you
-  mount from the shell instead, keep a WSL process running.
-- **Accented filenames** were verified byte-identical across the HFS+/NTFS hop
-  (composed form, no NFD/NFC drift), but this was tested on one dataset.
+  mount from a shell instead, keep a WSL process running.
+- **Rebuild the module after a WSL kernel update.** Re-run
+  `install/02-build-hfsplus-module.sh`.
+
+## Why the kernel build is necessary
+
+Microsoft's stock WSL2 kernel ships `CONFIG_HFSPLUS_FS` **unset**. The Kconfig
+symbol still exists, so the source is there — but:
+
+- `CONFIG_MODVERSIONS=y` means symbol CRCs must match, and those only come from
+  `Module.symvers`, which requires a **full** kernel build. A
+  `modules_prepare`-only build dies with
+  `disagrees about version of symbol module_layout`.
+- Rebuilding with a different compiler than Microsoft used produces different
+  CRCs anyway, so the module still will not load into the stock kernel.
+
+So the installer builds the kernel, installs it, and points WSL at it via
+`.wslconfig`. Kernel and modules then match by construction and nothing is
+force-loaded. The script also deletes `.git` from the source tree first —
+otherwise `scripts/setlocalversion` appends `+` to the version string and the
+kernel looks for modules in a directory that does not exist.
 
 ## Layout
 
 ```
-app/        GUI (PowerShell + WinForms) and its no-console launcher
+app/        GUI (PowerShell + WinForms), launcher, compiled exe
 install/    One-time host setup and the kernel module build
 scripts/    mount / umount / sync, shared config loader
+Start.cmd   Double-click launcher
 macdrive.conf.example
 ```
+
+---
+
+## Donate
+
+This replaces software that costs real money, and it is free and always will be.
+If it saved you the price of a licence and you feel like passing some of that
+back, it is genuinely appreciated — and entirely optional.
+
+**Venmo: `@your-venmo-here`**
+
+<!-- Replace @your-venmo-here with the real handle.
+     A Venmo profile link also works: https://venmo.com/u/your-handle -->
+
+Bug reports and pull requests are worth just as much.
 
 ## License
 

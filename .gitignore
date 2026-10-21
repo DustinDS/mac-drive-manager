@@ -8,3 +8,7 @@ settings.json
 # Never commit media or project data
 /working-copy/
 /backup/
+
+# Compiled output - published via GitHub Releases instead
+*.exe
+/release/

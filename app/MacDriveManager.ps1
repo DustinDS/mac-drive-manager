@@ -16,12 +16,25 @@ Add-Type -AssemblyName System.Drawing
 
 # ---------------- paths & config ----------------
 
-$script:ROOT = Split-Path -Parent $PSScriptRoot
+# Resolve our own folder. $PSScriptRoot is empty when running as a compiled
+# .exe, so fall back to the running image's location.
+$script:APPDIR = $PSScriptRoot
+if (-not $script:APPDIR) {
+    $script:APPDIR = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+}
+
+# Normally app/ sits under the repo root, but allow the exe to be dropped
+# beside macdrive.conf too.
+$script:ROOT = Split-Path -Parent $script:APPDIR
 $confPath    = Join-Path $script:ROOT 'macdrive.conf'
+if (-not (Test-Path $confPath)) {
+    $alt = Join-Path $script:APPDIR 'macdrive.conf'
+    if (Test-Path $alt) { $script:ROOT = $script:APPDIR; $confPath = $alt }
+}
 
 if (-not (Test-Path $confPath)) {
     [System.Windows.Forms.MessageBox]::Show(
-        "macdrive.conf not found at:`n$confPath`n`nCopy macdrive.conf.example to macdrive.conf and edit it.",
+        "macdrive.conf not found.`n`nLooked in:`n  $script:ROOT`n  $script:APPDIR`n`nCopy macdrive.conf.example to macdrive.conf and edit it.",
         'Mac Drive Manager', 'OK', 'Error') | Out-Null
     exit 1
 }
@@ -586,19 +599,12 @@ $log.Multiline   = $true
 $log.ScrollBars  = 'Vertical'
 $log.ReadOnly    = $true
 $log.Location    = New-Object System.Drawing.Point(20, 379)
-$log.Size        = New-Object System.Drawing.Size(600, 240)
+$log.Size        = New-Object System.Drawing.Size(600, 262)
 $log.BackColor   = [System.Drawing.Color]::FromArgb(22, 24, 29)
 $log.ForeColor   = [System.Drawing.Color]::FromArgb(205, 212, 222)
 $log.Font        = New-Object System.Drawing.Font('Consolas', 9)
 $log.BorderStyle = 'FixedSingle'
 $form.Controls.Add($log)
-
-$lblHint           = New-Object System.Windows.Forms.Label
-$lblHint.Text      = 'Eject Safely always flushes writes first. Never unplug without it.'
-$lblHint.ForeColor = $cAmber
-$lblHint.Location  = New-Object System.Drawing.Point(20, 628)
-$lblHint.Size      = New-Object System.Drawing.Size(600, 20)
-$form.Controls.Add($lblHint)
 
 # ---------------- behaviour ----------------
 
