@@ -1,0 +1,10 @@
+# Local machine configuration - copy from macdrive.conf.example
+macdrive.conf
+
+# Runtime state
+settings.json
+*.log
+
+# Never commit media or project data
+/working-copy/
+/backup/

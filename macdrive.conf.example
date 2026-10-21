@@ -1,0 +1,29 @@
+# macdrive.conf - copy to "macdrive.conf" and edit for your machine.
+# Sourced by the shell scripts and parsed by the PowerShell app.
+# Keep it as KEY="value" lines; no spaces around "=".
+
+# WSL distribution that hosts the HFS+ mount.
+DISTRO="Ubuntu"
+
+# USB hardware ID of your drive, as "VID:PID".
+# Find it by running:  usbipd list
+HWID="0781:55af"
+
+# Where the drive gets mounted inside WSL.
+MOUNTPOINT="/mnt/mac"
+
+# Local working copy. Editing straight off the HFS+ mount works but is slow,
+# so the tool keeps a fast local copy and syncs it back on eject.
+# Give the SAME folder in both Windows and WSL form.
+LOCAL_WIN="D:\\MacDriveSync"
+LOCAL_WSL="/mnt/d/MacDriveSync"
+
+# Where overwritten files get archived (never deleted outright).
+ARCHIVE_WSL="/mnt/d/MacDriveSync-replaced"
+
+# Cosmetic labels shown in the app.
+DRIVE_NAME="My Mac Drive"
+DRIVE_MODEL="External HFS+ drive"
+
+# Path to usbipd.exe (default install location).
+USBIPD="C:\\Program Files\\usbipd-win\\usbipd.exe"
