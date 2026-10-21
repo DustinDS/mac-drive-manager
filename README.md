@@ -31,6 +31,10 @@ don't have, and the source.
 Built for a video-editing workflow — camera footage and a Premiere project
 authored on a Mac, edited on a PC — but nothing here is specific to video.
 
+> **Free, and staying free.** If it saves you a licence fee, you can
+> [buy me a coffee on Venmo](https://venmo.com/u/your-venmo-handle) — completely
+> optional, nothing is gated. See [Donate](#donate).
+
 ---
 
 ## Quickstart
@@ -192,16 +196,30 @@ macdrive.conf.example
 
 ## Donate
 
-This replaces software that costs real money, and it is free and always will be.
-If it saved you the price of a licence and you feel like passing some of that
-back, it is genuinely appreciated — and entirely optional.
+This does the job of a driver that costs **$20–$50**. It is free, it is MIT
+licensed, and it stays that way — there is no paid tier, no nag screen, and
+nothing is held back.
 
-**Venmo: `@your-venmo-here`**
+If it saved you a licence fee and you want to send some of that back, that is
+genuinely appreciated. It is entirely optional and nothing here is gated behind
+it.
 
-<!-- Replace @your-venmo-here with the real handle.
-     A Venmo profile link also works: https://venmo.com/u/your-handle -->
+### 💸 Venmo
 
-Bug reports and pull requests are worth just as much.
+> ### **[@your-venmo-handle](https://venmo.com/u/your-venmo-handle)**
+
+<!-- ────────────────────────────────────────────────────────────────────
+     EDIT ME: replace BOTH copies of  your-venmo-handle  on the line above
+     with your Venmo username — the one at the end of your profile URL,
+     without the @.
+
+     Example, for a handle of  dustin-s :
+       > ### **[@dustin-s](https://venmo.com/u/dustin-s)**
+     ──────────────────────────────────────────────────────────────────── -->
+
+**Other ways to help, which are worth just as much:** open an issue when
+something breaks, send a pull request, or tell someone who has been staring at a
+Mac drive that Windows refuses to mount.
 
 ## License
 
