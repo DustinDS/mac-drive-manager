@@ -32,7 +32,7 @@ Built for a video-editing workflow — camera footage and a Premiere project
 authored on a Mac, edited on a PC — but nothing here is specific to video.
 
 > **Free, and staying free.** If it saves you a licence fee, you can
-> [buy me a coffee on Venmo](https://venmo.com/u/your-venmo-handle) — completely
+> [buy me a coffee on Venmo](https://venmo.com/u/Dustin-DivineSicherman) — completely
 > optional, nothing is gated. See [Donate](#donate).
 
 ---
@@ -206,16 +206,7 @@ it.
 
 ### 💸 Venmo
 
-> ### **[@your-venmo-handle](https://venmo.com/u/your-venmo-handle)**
-
-<!-- ────────────────────────────────────────────────────────────────────
-     EDIT ME: replace BOTH copies of  your-venmo-handle  on the line above
-     with your Venmo username — the one at the end of your profile URL,
-     without the @.
-
-     Example, for a handle of  jane-doe :
-       > ### **[@jane-doe](https://venmo.com/u/jane-doe)**
-     ──────────────────────────────────────────────────────────────────── -->
+> ### **[@Dustin-DivineSicherman](https://venmo.com/u/Dustin-DivineSicherman)**
 
 **Other ways to help, which are worth just as much:** open an issue when
 something breaks, send a pull request, or tell someone who has been staring at a
