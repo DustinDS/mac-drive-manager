@@ -1,7 +1,11 @@
-# ============================================================
+﻿# ============================================================
 #  Mac Drive Manager
 #  Detect, mount, sync and safely eject an HFS+ (Mac) drive on Windows,
 #  using WSL2 + usbipd as the bridge.
+#
+#  Long operations run in a background runspace and stream their output to a
+#  temp file, which the UI timer tails. That keeps the window repainting, so
+#  the spinner and progress bar stay smooth instead of freezing.
 #
 #  Configuration lives in ../macdrive.conf
 # ============================================================
@@ -58,6 +62,10 @@ $script:UNC = $bs + $bs + 'wsl.localhost' + $bs + $script:DISTRO + ($script:MOUN
 
 $script:AutoSync  = $true
 $script:LastState = $null
+$script:Job       = $null
+$script:Phase     = 0.0     # animation clock
+$script:Busy      = $false
+$script:BusyText  = ''
 
 # ---------------- colors ----------------
 $cBg    = [System.Drawing.Color]::FromArgb(32, 34, 40)
@@ -82,6 +90,25 @@ function Clean-Text {
     return ($Text -replace "`0", '')
 }
 
+# Read a file that another process is actively appending to. Get-Content opens
+# it in a way that intermittently throws "used by another process" against a
+# live writer, which would silently drop log lines.
+function Read-SharedText {
+    param([string]$Path)
+    try {
+        $fs = New-Object System.IO.FileStream(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite)
+        $sr  = New-Object System.IO.StreamReader($fs)
+        $txt = $sr.ReadToEnd()
+        $sr.Close(); $fs.Close()
+        return $txt
+    } catch { return $null }
+}
+
+# Synchronous - only for fast calls (status polling).
 function Invoke-Wsl {
     param([string]$BashArgs)
     $out = & wsl.exe -d $script:DISTRO -u root -- bash -c $BashArgs 2>&1 | Out-String
@@ -105,25 +132,11 @@ function Save-Settings {
     } catch { }
 }
 
-# WSL shuts down an idle distro, which silently drops the mount. Hold it open.
-function Ensure-KeepAlive {
-    $alive = Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" -ErrorAction SilentlyContinue |
-             Where-Object { $_.CommandLine -match 'sleep' }
-    if (-not $alive) {
-        Start-Process -WindowStyle Hidden wsl.exe `
-            -ArgumentList '-d', $script:DISTRO, '-u', 'root', '--', 'sleep', 'infinity'
-        Start-Sleep -Seconds 3
-        return $true
-    }
-    return $false
-}
-
 function Get-DriveState {
     $state = [pscustomobject]@{
         Present = $false; Where = 'Unplugged'; Mounted = $false
         BusId = ''; Device = ''; Size = ''; Used = ''; Avail = ''; Note = ''
     }
-
     if (-not (Test-Path $script:USBIPD)) { $state.Note = 'usbipd-win not found'; return $state }
 
     $raw  = Clean-Text ((& $script:USBIPD list 2>&1 | Out-String))
@@ -158,19 +171,178 @@ function Get-DriveState {
     return $state
 }
 
-function Get-PendingCounts {
-    $res = [pscustomobject]@{ Up = -1; Down = -1 }
-    if (-not (Test-Path $script:LOCAL)) { return $res }
-    $r = Invoke-Wsl ('bash ' + $script:STAT_SH)
-    if ($r.Output -match 'PENDING_UP=(\d+)')   { $res.Up   = [int]$matches[1] }
-    if ($r.Output -match 'PENDING_DOWN=(\d+)') { $res.Down = [int]$matches[1] }
-    return $res
-}
-
 function Find-Project {
     if (-not (Test-Path $script:LOCAL)) { return $null }
     return Get-ChildItem -Path $script:LOCAL -Filter '*.prproj' -File -ErrorAction SilentlyContinue |
            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+# ---------------- background work ----------------
+# The operation body runs in its own runspace. It cannot see this scope, so
+# everything it needs is passed in, and it reports progress by appending to
+# $OutFile, which the UI timer tails.
+
+$script:OpBody = {
+    param($Op, $Conf, $OutFile)
+
+    # Open the progress file with FileShare::ReadWrite so the UI can tail it
+    # while we are still writing. Add-Content locks it exclusively enough that
+    # the reader intermittently fails with "used by another process".
+    $fs = New-Object System.IO.FileStream(
+        $Conf.OutFile,
+        [System.IO.FileMode]::Append,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::ReadWrite)
+    $sw = New-Object System.IO.StreamWriter($fs)
+    $sw.AutoFlush = $true
+
+    function Emit { param($m) $sw.WriteLine($m) }
+    function RunWsl {
+        param($cmd)
+        $o = & wsl.exe -d $Conf.Distro -u root -- bash -c $cmd 2>&1 | Out-String
+        $o = $o -replace "`0", ''
+        foreach ($l in ($o -split "`r?`n")) { if ($l.Trim()) { Emit ('  ' + $l.Trim()) } }
+        return $LASTEXITCODE
+    }
+
+    try {
+    switch ($Op) {
+
+        'mount' {
+            $alive = Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.CommandLine -match 'sleep' }
+            if (-not $alive) {
+                Emit 'Starting the Linux helper (keeps the mount alive)...'
+                Start-Process -WindowStyle Hidden wsl.exe `
+                    -ArgumentList '-d', $Conf.Distro, '-u', 'root', '--', 'sleep', 'infinity'
+                Start-Sleep -Seconds 3
+            }
+
+            if ($Conf.NeedAttach) {
+                Emit 'Attaching the drive to WSL...'
+                $a = & $Conf.Usbipd attach --wsl --hardware-id $Conf.Hwid 2>&1 | Out-String
+                if ($LASTEXITCODE -ne 0) {
+                    Emit ('ERROR attaching: ' + ($a -replace "`0", '').Trim())
+                    Emit '##FAIL##'; return
+                }
+                Start-Sleep -Seconds 4
+            }
+
+            Emit 'Mounting read/write...'
+            if ((RunWsl ('bash ' + $Conf.MountSh)) -ne 0) { Emit '##FAIL##'; return }
+
+            if ($Conf.AutoSync) {
+                Emit 'Auto-sync ON - pulling to the local working copy...'
+                RunWsl ('bash ' + $Conf.DownSh) | Out-Null
+            }
+            Emit '##OK##'
+        }
+
+        'down' {
+            Emit 'Pulling from the drive...'
+            $rc = RunWsl ('bash ' + $Conf.DownSh)
+            if ($rc -eq 0) { Emit '##OK##' } else { Emit '##FAIL##' }
+        }
+
+        'up' {
+            Emit 'Pushing to the drive...'
+            $rc = RunWsl ('bash ' + $Conf.UpSh)
+            if ($rc -eq 0) { Emit '##OK##' } else { Emit '##FAIL##' }
+        }
+
+        'eject' {
+            if ($Conf.SyncFirst) {
+                Emit 'Sending local changes back before ejecting...'
+                if ((RunWsl ('bash ' + $Conf.UpSh)) -ne 0) {
+                    Emit 'SYNC FAILED - stopping. The drive was NOT ejected, so nothing is lost.'
+                    Emit '##FAIL##'; return
+                }
+            }
+            Emit 'Flushing writes and unmounting...'
+            if ((RunWsl ('bash ' + $Conf.UmountSh)) -ne 0) {
+                Emit 'EJECT FAILED - a file is still open. Close any app using the drive and retry.'
+                Emit '##FAIL##'; return
+            }
+            & $Conf.Usbipd detach --hardware-id $Conf.Hwid 2>&1 | Out-Null
+            Emit 'Released the drive back to Windows.'
+            Emit '##EJECTED##'
+        }
+    }
+    }
+    finally {
+        try { $sw.Flush(); $sw.Close(); $fs.Close() } catch { }
+    }
+}
+
+function Start-Operation {
+    param(
+        [string]$Op,
+        [string]$BusyText,
+        [hashtable]$Extra = @{}
+    )
+
+    $outFile = [IO.Path]::Combine([IO.Path]::GetTempPath(), 'mdm-' + [Guid]::NewGuid().ToString('N') + '.log')
+    New-Item -ItemType File -Path $outFile -Force | Out-Null
+
+    $c = @{
+        Distro   = $script:DISTRO
+        Usbipd   = $script:USBIPD
+        Hwid     = $script:HWID
+        MountSh  = $script:MOUNT_SH
+        UmountSh = $script:UMOUNT_SH
+        DownSh   = $script:DOWN_SH
+        UpSh     = $script:UP_SH
+        AutoSync = $script:AutoSync
+        OutFile  = $outFile
+    }
+    foreach ($k in $Extra.Keys) { $c[$k] = $Extra[$k] }
+
+    $ps = [PowerShell]::Create()
+    $null = $ps.AddScript($script:OpBody.ToString()).AddArgument($Op).AddArgument($c).AddArgument($outFile)
+
+    $script:Job = [pscustomobject]@{
+        PS = $ps; Handle = $ps.BeginInvoke(); File = $outFile; Pos = 0; Op = $Op
+    }
+
+    $script:Busy     = $true
+    $script:BusyText = $BusyText
+    Set-Controls $false
+    $bar.Visible = $true
+    $spin.Visible = $true
+    $lblState.Text = $BusyText
+    $dot.Visible = $false
+}
+
+function Finish-Operation {
+    param([string]$Outcome)
+
+    $script:Busy  = $false
+    $bar.Visible  = $false
+    $spin.Visible = $false
+    $dot.Visible  = $true
+    Set-Controls $true
+
+    try { Remove-Item -LiteralPath $script:Job.File -Force -ErrorAction SilentlyContinue } catch { }
+    $op = $script:Job.Op
+    $script:Job.PS.Dispose()
+    $script:Job = $null
+
+    if ($Outcome -eq 'EJECTED') {
+        Write-Log '================================'
+        Write-Log ' EJECTED - SAFE TO UNPLUG NOW'
+        Write-Log '================================'
+        $dot.ForeColor  = $cBlue
+        $lblState.Text  = 'Ejected - safe to unplug'
+        $lblDetail.Text = 'Writes flushed, volume unmounted cleanly, drive released.'
+        Set-Controls $true
+        $btnDown.Enabled = $false; $btnUp.Enabled = $false; $btnEject.Enabled = $false
+        return
+    }
+
+    if ($Outcome -eq 'FAIL') { Write-Log 'Operation did not complete.' }
+    elseif ($op -eq 'mount') { Write-Log 'Mounted read/write.' }
+
+    Refresh-Ui
 }
 
 # ---------------- form ----------------
@@ -183,6 +355,7 @@ $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox     = $false
 $form.BackColor       = $cBg
 $form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
+$form.Opacity         = 0        # faded in on load
 
 $lblTitle           = New-Object System.Windows.Forms.Label
 $lblTitle.Text      = $script:DRIVENAME
@@ -199,7 +372,7 @@ $lblModel.Location  = New-Object System.Drawing.Point(22, 46)
 $lblModel.Size      = New-Object System.Drawing.Size(380, 20)
 $form.Controls.Add($lblModel)
 
-# --- auto-sync toggle (top right) ---
+# --- auto-sync toggle ---
 $lblTog           = New-Object System.Windows.Forms.Label
 $lblTog.Text      = 'Auto-sync'
 $lblTog.ForeColor = $cDim
@@ -223,6 +396,9 @@ $tog.BackColor = $cBg
 $tog.Cursor    = [System.Windows.Forms.Cursors]::Hand
 $form.Controls.Add($tog)
 
+# Knob position is animated, so the toggle slides instead of jumping.
+$script:TogPos = 1.0
+
 $tog.Add_Paint({
     param($sender, $e)
     $g = $e.Graphics
@@ -232,13 +408,15 @@ $tog.Add_Paint({
     $path.AddArc(0, 0, $h, $h, 90, 180)
     $path.AddArc($w - $h, 0, $h, $h, 270, 180)
     $path.CloseFigure()
-    if ($script:AutoSync) { $fill = [System.Drawing.Color]::FromArgb(40, 150, 95) }
-    else                  { $fill = [System.Drawing.Color]::FromArgb(78, 82, 94) }
-    $brush = New-Object System.Drawing.SolidBrush $fill
+
+    $t = $script:TogPos
+    $r = [int](78 + (40 - 78) * $t); $gg = [int](82 + (150 - 82) * $t); $b = [int](94 + (95 - 94) * $t)
+    $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($r, $gg, $b))
     $g.FillPath($brush, $path); $brush.Dispose()
+
     $pad = 4; $kd = $h - ($pad * 2)
-    if ($script:AutoSync) { $kx = $w - $kd - $pad } else { $kx = $pad }
-    $g.FillEllipse([System.Drawing.Brushes]::White, $kx, $pad, $kd, $kd)
+    $kx = $pad + ($w - $kd - ($pad * 2)) * $t
+    $g.FillEllipse([System.Drawing.Brushes]::White, [float]$kx, [float]$pad, [float]$kd, [float]$kd)
     $path.Dispose()
 })
 
@@ -257,8 +435,33 @@ $dot.Size      = New-Object System.Drawing.Size(44, 46)
 $dot.ForeColor = $cGrey
 $panel.Controls.Add($dot)
 
+# Spinner replaces the dot while an operation runs.
+$spin           = New-Object System.Windows.Forms.Panel
+$spin.Location  = New-Object System.Drawing.Point(16, 20)
+$spin.Size      = New-Object System.Drawing.Size(30, 30)
+$spin.BackColor = $cCard
+$spin.Visible   = $false
+$panel.Controls.Add($spin)
+
+$spin.Add_Paint({
+    param($sender, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $pad = 3
+    $rect = New-Object System.Drawing.RectangleF($pad, $pad, $sender.Width - ($pad*2), $sender.Height - ($pad*2))
+    $penBg = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(70, 75, 88)), 3
+    $g.DrawEllipse($penBg, $rect); $penBg.Dispose()
+    $start = ($script:Phase * 220) % 360
+    $sweep = 90 + 45 * [Math]::Sin($script:Phase * 2.2)
+    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(90, 185, 255)), 3
+    $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $pen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
+    $g.DrawArc($pen, $rect, [float]$start, [float]$sweep)
+    $pen.Dispose()
+})
+
 $lblState           = New-Object System.Windows.Forms.Label
-$lblState.Text      = 'Checking...'
+$lblState.Text      = 'Starting...'
 $lblState.Font      = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
 $lblState.ForeColor = $cText
 $lblState.Location  = New-Object System.Drawing.Point(58, 14)
@@ -270,6 +473,50 @@ $lblDetail.ForeColor = $cDim
 $lblDetail.Location  = New-Object System.Drawing.Point(60, 42)
 $lblDetail.Size      = New-Object System.Drawing.Size(528, 44)
 $panel.Controls.Add($lblDetail)
+
+# Indeterminate progress bar: a soft highlight sliding along a track.
+$bar           = New-Object System.Windows.Forms.Panel
+$bar.Location  = New-Object System.Drawing.Point(60, 74)
+$bar.Size      = New-Object System.Drawing.Size(520, 6)
+$bar.BackColor = $cCard
+$bar.Visible   = $false
+$panel.Controls.Add($bar)
+
+$bar.Add_Paint({
+    param($sender, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $w = $sender.Width; $h = $sender.Height
+
+    $track = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(62, 66, 78))
+    $g.FillRectangle($track, 0, 0, $w, $h); $track.Dispose()
+
+    # Ease in/out so the highlight glides rather than scrolling linearly.
+    $t = ($script:Phase * 0.55) % 2.0
+    if ($t -gt 1.0) { $t = 2.0 - $t }
+    $e2 = $t * $t * (3.0 - 2.0 * $t)
+
+    $segW = [int]($w * 0.34)
+    $x    = [int](($w + $segW) * $e2) - $segW
+
+    $r = New-Object System.Drawing.Rectangle($x, 0, $segW, $h)
+    if ($segW -gt 0) {
+        $lg = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+            $r,
+            [System.Drawing.Color]::FromArgb(0, 90, 185, 255),
+            [System.Drawing.Color]::FromArgb(255, 90, 185, 255),
+            [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal)
+        $blend = New-Object System.Drawing.Drawing2D.ColorBlend 3
+        $blend.Colors = @(
+            [System.Drawing.Color]::FromArgb(0, 90, 185, 255),
+            [System.Drawing.Color]::FromArgb(235, 120, 200, 255),
+            [System.Drawing.Color]::FromArgb(0, 90, 185, 255))
+        $blend.Positions = @(0.0, 0.5, 1.0)
+        $lg.InterpolationColors = $blend
+        $g.FillRectangle($lg, $r)
+        $lg.Dispose()
+    }
+})
 
 # --- local working copy card ---
 $panel2           = New-Object System.Windows.Forms.Panel
@@ -293,6 +540,7 @@ $lblLocal.Size      = New-Object System.Drawing.Size(570, 36)
 $lblLocal.Text      = $script:LOCAL
 $panel2.Controls.Add($lblLocal)
 
+# --- buttons, with a hover lift ---
 function New-Btn {
     param($Text, $X, $Y, $W, $Accent)
     $b           = New-Object System.Windows.Forms.Button
@@ -304,6 +552,16 @@ function New-Btn {
     $b.BackColor = $Accent
     $b.Font      = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $b.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $b.FlatAppearance.BorderSize = 0
+    $b.Tag = $Accent
+    $b.Add_MouseEnter({
+        $base = $this.Tag
+        $this.BackColor = [System.Drawing.Color]::FromArgb(
+            [Math]::Min(255, $base.R + 28),
+            [Math]::Min(255, $base.G + 28),
+            [Math]::Min(255, $base.B + 28))
+    })
+    $b.Add_MouseLeave({ $this.BackColor = $this.Tag })
     return $b
 }
 
@@ -347,30 +605,19 @@ $form.Controls.Add($lblHint)
 function Write-Log {
     param([string]$Msg)
     $log.AppendText('[' + (Get-Date).ToString('HH:mm:ss') + '] ' + $Msg + "`r`n")
-    [System.Windows.Forms.Application]::DoEvents()
 }
 
-function Write-Out {
-    param($Result)
-    foreach ($ln in ($Result.Output -split "`r?`n")) {
-        if ($ln.Trim()) { Write-Log ('  ' + $ln.Trim()) }
-    }
-}
-
-function Set-Busy {
+function Set-Controls {
     param([bool]$On)
     foreach ($b in @($btnStatus,$btnMount,$btnDown,$btnUp,$btnOpen,$btnFolder,$btnEject)) {
-        $b.Enabled = -not $On
+        $b.Enabled = $On
     }
-    if ($On) { $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor }
-    else     { $form.Cursor = [System.Windows.Forms.Cursors]::Default }
-    [System.Windows.Forms.Application]::DoEvents()
+    $tog.Enabled = $On
 }
 
 function Update-ToggleUi {
     if ($script:AutoSync) { $lblTogState.Text = 'ON';  $lblTogState.ForeColor = $cGreen }
     else                  { $lblTogState.Text = 'OFF'; $lblTogState.ForeColor = $cDim }
-    $tog.Invalidate()
 }
 
 function Refresh-Local {
@@ -387,6 +634,7 @@ function Refresh-Local {
 
 function Refresh-Ui {
     param([bool]$Announce = $false)
+    if ($script:Busy) { return }
 
     $s = Get-DriveState
     $script:LastState = $s
@@ -435,63 +683,25 @@ $tog.Add_Click({
 })
 
 $btnStatus.Add_Click({
-    Set-Busy $true
     Write-Log 'Checking...'
     Refresh-Ui -Announce $true
-    if ($script:LastState.Mounted -and (Test-Path $script:LOCAL)) {
-        $p = Get-PendingCounts
-        if ($p.Up -ge 0)   { Write-Log ('  ' + $p.Up + ' file(s) newer locally (would go TO the drive)') }
-        if ($p.Down -ge 0) { Write-Log ('  ' + $p.Down + ' file(s) newer on the drive (would come DOWN)') }
-    }
-    Set-Busy $false
 })
 
 $btnMount.Add_Click({
-    Set-Busy $true
-    Write-Log 'Mounting...'
     $s = Get-DriveState
-    if (-not $s.Present) { Write-Log 'ERROR: drive is not plugged in.'; Set-Busy $false; Refresh-Ui; return }
-
-    if (Ensure-KeepAlive) { Write-Log 'Started the Linux helper (keeps the mount alive).' }
-
-    if ($s.Where -ne 'WSL') {
-        Write-Log 'Attaching the drive...'
-        $att = & $script:USBIPD attach --wsl --hardware-id $script:HWID 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log ('ERROR attaching: ' + (Clean-Text $att).Trim())
-            Set-Busy $false; Refresh-Ui; return
-        }
-        Start-Sleep -Seconds 4
-    }
-
-    Write-Out (Invoke-Wsl ('bash ' + $script:MOUNT_SH))
-    Refresh-Ui
-
-    if ($script:LastState.Mounted) {
-        Write-Log 'Mounted read/write.'
-        if ($script:AutoSync) {
-            Write-Log 'Auto-sync ON - pulling to the local working copy...'
-            Write-Out (Invoke-Wsl ('bash ' + $script:DOWN_SH))
-            Refresh-Local
-        }
-    } else { Write-Log 'Mount did not complete.' }
-    Set-Busy $false
+    if (-not $s.Present) { Write-Log 'ERROR: drive is not plugged in.'; return }
+    Write-Log 'Mounting...'
+    Start-Operation -Op 'mount' -BusyText 'Mounting...' -Extra @{ NeedAttach = ($s.Where -ne 'WSL') }
 })
 
 $btnDown.Add_Click({
-    Set-Busy $true
     Write-Log 'Pulling from the drive...'
-    $r = Invoke-Wsl ('bash ' + $script:DOWN_SH)
-    Write-Out $r
-    Refresh-Local
-    Set-Busy $false
+    Start-Operation -Op 'down' -BusyText 'Copying from drive...'
 })
 
 $btnUp.Add_Click({
-    Set-Busy $true
     Write-Log 'Pushing to the drive...'
-    Write-Out (Invoke-Wsl ('bash ' + $script:UP_SH))
-    Set-Busy $false
+    Start-Operation -Op 'up' -BusyText 'Copying to drive...'
 })
 
 $btnOpen.Add_Click({
@@ -508,69 +718,146 @@ $btnFolder.Add_Click({
 })
 
 $btnEject.Add_Click({
-    Set-Busy $true
-
+    $syncFirst = $false
     if (Test-Path $script:LOCAL) {
-        if ($script:AutoSync) {
-            Write-Log 'Auto-sync ON - sending local changes back before ejecting...'
-            $r = Invoke-Wsl ('bash ' + $script:UP_SH)
-            Write-Out $r
-            if ($r.Code -ne 0) {
-                Write-Log 'SYNC FAILED - stopping. The drive was NOT ejected, so nothing is lost.'
-                Set-Busy $false; Refresh-Ui; return
-            }
-        }
+        if ($script:AutoSync) { $syncFirst = $true }
         else {
-            $p = Get-PendingCounts
-            if ($p.Up -gt 0) {
+            $r = Invoke-Wsl ('bash ' + $script:STAT_SH)
+            $up = 0
+            if ($r.Output -match 'PENDING_UP=(\d+)') { $up = [int]$matches[1] }
+            if ($up -gt 0) {
                 $ans = [System.Windows.Forms.MessageBox]::Show(
-                    ("$($p.Up) file(s) are newer locally and not on the drive yet.`n`nSync them before ejecting?"),
+                    ("$up file(s) are newer locally and not on the drive yet.`n`nSync them before ejecting?"),
                     'Unsynced changes', 'YesNoCancel', 'Warning')
-                if ($ans -eq 'Cancel') { Write-Log 'Eject cancelled.'; Set-Busy $false; Refresh-Ui; return }
-                if ($ans -eq 'Yes') {
-                    $r = Invoke-Wsl ('bash ' + $script:UP_SH)
-                    Write-Out $r
-                    if ($r.Code -ne 0) { Write-Log 'SYNC FAILED - drive NOT ejected.'; Set-Busy $false; Refresh-Ui; return }
-                } else { Write-Log 'Skipping sync - local changes stay only on the local copy.' }
+                if ($ans -eq 'Cancel') { Write-Log 'Eject cancelled.'; return }
+                if ($ans -eq 'Yes')    { $syncFirst = $true }
+                else { Write-Log 'Skipping sync - local changes stay only on the local copy.' }
             }
         }
     }
-
-    Write-Log 'Flushing writes and unmounting...'
-    $u = Invoke-Wsl ('bash ' + $script:UMOUNT_SH)
-    Write-Out $u
-    if ($u.Code -ne 0) {
-        Write-Log 'EJECT FAILED - a file is still open. Close any app using the drive and retry.'
-        Set-Busy $false; Refresh-Ui; return
-    }
-
-    $null = & $script:USBIPD detach --hardware-id $script:HWID 2>&1
-    Write-Log 'Released the drive back to Windows.'
-    Write-Log '================================'
-    Write-Log ' EJECTED - SAFE TO UNPLUG NOW'
-    Write-Log '================================'
-
-    $dot.ForeColor  = $cBlue
-    $lblState.Text  = 'Ejected - safe to unplug'
-    $lblDetail.Text = 'Writes flushed, volume unmounted cleanly, drive released.'
-    Set-Busy $false
-    $btnMount.Enabled = $true
-    $btnDown.Enabled = $false; $btnUp.Enabled = $false; $btnEject.Enabled = $false
+    Write-Log 'Ejecting...'
+    Start-Operation -Op 'eject' -BusyText 'Ejecting...' -Extra @{ SyncFirst = $syncFirst }
 })
 
-# Light auto-refresh: drive presence only, no rsync scans here.
-$timer          = New-Object System.Windows.Forms.Timer
-$timer.Interval = 5000
-$timer.Add_Tick({ if ($btnStatus.Enabled) { Refresh-Ui } })
-$timer.Start()
+# ---------------- animation / polling loop ----------------
+# One fast timer drives every moving thing. Heavier work is rate-limited by
+# frame count so the animation itself stays cheap.
+
+$script:Frame      = 0
+$script:FadeIn     = $true
+$script:SplashDone = $false
+
+$anim          = New-Object System.Windows.Forms.Timer
+$anim.Interval = 20                      # ~50 fps
+$anim.Add_Tick({
+    $script:Frame++
+    $script:Phase += 0.02
+
+    # fade the window in on launch
+    if ($script:FadeIn) {
+        $o = $form.Opacity + 0.07
+        if ($o -ge 1.0) { $o = 1.0; $script:FadeIn = $false }
+        $form.Opacity = $o
+    }
+
+    # ease the auto-sync knob toward its target
+    $target = if ($script:AutoSync) { 1.0 } else { 0.0 }
+    if ([Math]::Abs($script:TogPos - $target) -gt 0.001) {
+        $script:TogPos += ($target - $script:TogPos) * 0.25
+        $tog.Invalidate()
+    }
+
+    if ($script:Busy) {
+        $spin.Invalidate()
+        $bar.Invalidate()
+
+        # animated ellipsis on the status line
+        if ($script:Frame % 25 -eq 0) {
+            $dots = '.' * (1 + (($script:Frame / 25) % 3))
+            $lblState.Text = ($script:BusyText -replace '\.+$', '') + $dots
+        }
+
+        # Stream the background job's output into the log.
+        #
+        # The writer appends while we read, so the last line can be caught
+        # half-written. Only consume it once the file ends with a newline;
+        # otherwise hold it back for the next tick. Without this the tailer
+        # prints a truncated line and then skips past the rest of it.
+        if ($script:Job -and ($script:Frame % 5 -eq 0)) {
+            try {
+                $raw = Read-SharedText $script:Job.File
+                if ($raw) {
+                    $complete = $raw.EndsWith("`n")
+                    $lines = $raw -split "`r?`n"
+                    if ($lines.Count -gt 0 -and $lines[-1] -eq '') {
+                        if ($lines.Count -eq 1) { $lines = @() }
+                        else { $lines = $lines[0..($lines.Count - 2)] }
+                    }
+                    $avail = if ($complete) { $lines.Count } else { $lines.Count - 1 }
+                    for ($i = $script:Job.Pos; $i -lt $avail; $i++) {
+                        $line = $lines[$i]
+                        if ($line -notmatch '^##') { Write-Log $line }
+                    }
+                    if ($avail -gt $script:Job.Pos) { $script:Job.Pos = $avail }
+                }
+            } catch { }
+        }
+
+        if ($script:Job -and $script:Job.Handle.IsCompleted) {
+            $outcome = 'OK'
+            try {
+                # The writer has stopped, so everything in the file is complete
+                # now - flush whatever the tailer was still holding back.
+                $txt = Read-SharedText $script:Job.File; $all = @(); if ($txt) { $all = @($txt -split "`r?`n" | Where-Object { $_ -ne '' }) }
+                for ($i = $script:Job.Pos; $i -lt $all.Count; $i++) {
+                    if ($all[$i] -notmatch '^##') { Write-Log $all[$i] }
+                }
+                $script:Job.Pos = $all.Count
+
+                if ($all -match '##EJECTED##')  { $outcome = 'EJECTED' }
+                elseif ($all -match '##FAIL##') { $outcome = 'FAIL' }
+            } catch { }
+            try { $script:Job.PS.EndInvoke($script:Job.Handle) | Out-Null } catch { }
+            Finish-Operation $outcome
+        }
+        return
+    }
+
+    # first state check, once the fade has finished
+    if ($script:NeedFirstCheck -and -not $script:FadeIn) {
+        $script:NeedFirstCheck = $false
+        $spin.Invalidate(); [System.Windows.Forms.Application]::DoEvents()
+        Refresh-Ui -Announce $true
+        $spin.Visible = $false; $dot.Visible = $true
+        return
+    }
+
+    # idle: cheap presence poll every ~5s
+    if ($script:Frame % 250 -eq 0) { Refresh-Ui }
+})
 
 $form.Add_Shown({
     $script:AutoSync = Load-Settings
+    $script:TogPos   = if ($script:AutoSync) { 1.0 } else { 0.0 }
     Update-ToggleUi
     Write-Log 'Mac Drive Manager ready.'
     Write-Log ('Auto-sync is ' + $(if ($script:AutoSync) { 'ON' } else { 'OFF' }) + '.')
-    Refresh-Ui -Announce $true
+
+    # Defer the first state check until the fade-in has finished, so the window
+    # animates in cleanly instead of stalling on usbipd/wsl calls.
+    $dot.Visible = $false; $spin.Visible = $true
+    $lblState.Text = 'Looking for your drive...'
+    $script:NeedFirstCheck = $true
 })
 
+$form.Add_FormClosing({
+    $anim.Stop()
+    if ($script:Job) {
+        try { $script:Job.PS.Dispose() } catch { }
+    }
+})
+
+$anim.Start()
 [void]$form.ShowDialog()
-$timer.Stop()
+$anim.Stop()
+
